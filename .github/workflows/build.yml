@@ -1,0 +1,100 @@
+name: Build Flutter APK
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL asset zip project"
+        required: true
+      tag:
+        description: "Tag release"
+        required: true
+      build_type:
+        description: "release / debug"
+        required: false
+        default: "release"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Download project
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          curl -fsSL -L \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/octet-stream" \
+            "$ZIP_URL" -o project.zip
+          mkdir src && unzip -q project.zip -d src
+          PUB=$(find src -name pubspec.yaml -not -path "*/.*" | head -n 1)
+          [ -n "$PUB" ] || { echo "pubspec.yaml tidak ditemukan di zip"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$PUB")" >> $GITHUB_ENV
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Pastikan folder android ada
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ ! -d android ]; then
+            echo "Folder android tidak ada, membuat ulang..."
+            flutter create --platforms=android .
+          fi
+
+      - name: Auto-fix Gradle
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          W=android/gradle/wrapper/gradle-wrapper.properties
+          MIN=8.14
+          if [ -f "$W" ]; then
+            CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$W" | head -n 1 | sed 's/gradle-//')
+            echo "Gradle project: ${CUR:-tidak terdeteksi}"
+            if [ -n "$CUR" ] && [ "$(printf '%s\n%s\n' "$CUR" "$MIN" | sort -V | head -n 1)" != "$MIN" ]; then
+              sed -i -E "s#gradle-[0-9.]+-(all|bin)\.zip#gradle-$MIN-all.zip#" "$W"
+              echo "Gradle dinaikkan ke $MIN"
+            fi
+          fi
+          if [ -d android ]; then
+            touch android/gradle.properties
+            echo >> android/gradle.properties
+            grep -q '^android.newDsl' android/gradle.properties || echo 'android.newDsl=false' >> android/gradle.properties
+          fi
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          MODE=release
+          [ "$BUILD_TYPE" = "debug" ] && MODE=debug
+          flutter build apk --$MODE || {
+            echo "Build pertama gagal, coba ulang dengan skip validasi dependency..."
+            flutter build apk --$MODE --android-skip-build-dependency-validation
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/*.apk
+          retention-days: 1
+
+      - name: Hapus release sementara
+        if: always()
+        run: gh release delete "${{ inputs.tag }}" --cleanup-tag -y --repo "${{ github.repository }}" || true
+        env:
+          GH_TOKEN: ${{ github.token }}
